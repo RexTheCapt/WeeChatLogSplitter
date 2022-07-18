@@ -8,89 +8,84 @@ namespace WeeChatLogSplitter
 {
     internal class Program
     {
-        private static string logLocations = @"D:\Documents\IRC Logs";
-        private static DateTime lastPrint;
-        
+        private static string logLocation = @"D:\Documents\IRC Logs";
+        private readonly static string tmpLocation = "tmp\\";
+
         internal static void Main(string[] args)
         {
-            string tmpLocation = "tmp\\";
             if (Directory.Exists(tmpLocation))
                 Directory.Delete(tmpLocation, true);
 
             Directory.CreateDirectory(tmpLocation);
 
-            List<LogFile> logFiles = new();
-            foreach (string file in Directory.GetFiles(logLocations))
-            {
-                LogFile logFile = new();
-                FileInfo oldInfo = new FileInfo(file);
-                File.Copy(file, $"{tmpLocation}{oldInfo.Name}", false);
-                string newPath = $"{tmpLocation}{oldInfo.Name}";
-                FileInfo newInfo = new FileInfo(newPath);
-                logFile.FileInfo = newInfo;
+            List<LogFile> logFiles = GetLogFiles(logLocation);
 
-                List<LogEntry> logEntries = new();
-                using (var reader = new StreamReader(newInfo.FullName))
-                {
-                    while (!reader.EndOfStream)
-                    {
-                        string line = reader.ReadLine();
-                        LogEntry entry = new LogEntry()
-                        {
-                            Date = ToDateTime(line.Split(' ')[0]),
-                            Text = line
-                        };
-                        logEntries.Add(entry);
-                    }
-                }
-
-                logFile.LogEntries = logEntries;
-                logFiles.Add(logFile);
-            }
-
-            for (int fileIndex = 0; fileIndex < logFiles.Count; fileIndex++)
-            {
-                LogFile? logFile = logFiles[fileIndex];
-                for (int entryIndex = 0; entryIndex < logFile.LogEntries.Count; entryIndex++)
-                {
-                    if (lastPrint.AddSeconds(1) < DateTime.Now)
-                    {
-                        Console.WriteLine($"Working on file {fileIndex + 1:000}/{logFiles.Count:000} entry {entryIndex + 1:00000}/{logFile.LogEntries.Count:00000} ({GetPercentage(n1: logFiles.Count, n2: fileIndex)} | {GetPercentage(logFile.LogEntries.Count, entryIndex)})");
-                        lastPrint = DateTime.Now;
-                    }
-
-                    LogEntry? entry = logFile.LogEntries[entryIndex];
-                    int[] splitDate = new int[]
-                    {
-                        entry.Date.Year,
-                        entry.Date.Month,
-                    };
-
-                    string dir = $"{tmpLocation}";
-
-                    foreach (var v in splitDate)
-                    {
-                        dir += $"{v.ToString("00")}\\";
-                        if (!Directory.Exists(dir))
-                            Directory.CreateDirectory(dir);
-                    }
-
-                    dir += $"{logFile.FileInfo.Name}";
-
-                    using (var writer = new StreamWriter(dir, true))
-                    {
-                        writer.WriteLine(entry.Text);
-                    }
-                }
-            }
+            ProcessLogFiles(logFiles);
         }
 
-        private static string GetPercentage(int n1, int n2)
+        private static void ProcessLogFiles(List<LogFile> logFiles)
         {
-            if (n1 == 0 || n2 == 0)
-                return "000%";
-            float p = (float)n2 / n1 * 100;
-            return $"{p:000}%";
+            StreamWriter? writer = null;
+            string? writingPath = null;
+            string lastWriteFile = "";
+            int lineNr = 0;
+
+            foreach (LogFile log in logFiles)
+            {
+                Console.WriteLine(log.FullPath);
+
+                while (!log.ReadFileStream.EndOfStream)
+                {
+                    string? line = log.ReadFileStream.ReadLine();
+                    lineNr++;
+
+                    if (line == null) continue;
+
+                    try
+                    {
+                        DateTime date = ToDateTime(line.Split(' ')[0]);
+                        string writeDir = $"{tmpLocation}{log.Server}\\{log.Channel}";
+                        string writeFile = $"{writeDir}\\{date.ToString("yyyy-MM-dd")}.weechatlog";
+
+                        if (!Directory.Exists(writeDir))
+                            Directory.CreateDirectory(writeDir);
+
+                        #region Start writing to new location
+                        if (writingPath == null || writer == null)
+                        {
+                            NewWriter(path: writeFile, writer, out writer);
+                            writingPath = log.FullPath;
+                        }
+                        else
+                        {
+                            if (!log.FullPath.Equals(writingPath, StringComparison.OrdinalIgnoreCase) || !lastWriteFile.Equals(writeFile))
+                            {
+                                NewWriter(path: writeFile, writer, out writer);
+                                writingPath = log.FullPath;
+                            }
+                        }
+                        #endregion
+
+                        writer.WriteLine(line);
+                        lastWriteFile = writeFile;
+                    }
+                    catch (Exception ex)
+                    {
+                        ConsoleColor c = Console.ForegroundColor;
+                        Console.ForegroundColor = ConsoleColor.Red;
+                        Console.Write($"[{lineNr}] ");
+                        Console.WriteLine(ex.Message);
+                        Console.ForegroundColor = c;
+                    }
+                }
+
+                #region Close log reader
+                log.ReadFileStream.Close();
+                log.ReadFileStream.Dispose();
+                #endregion
+
+                lineNr = 0;
+            }
         }
 
         private static DateTime ToDateTime(string v)
@@ -103,26 +98,52 @@ namespace WeeChatLogSplitter
             return new DateTime(year, month, day);
         }
 
-        private class LogFile
+        private static void NewWriter(string path, StreamWriter? oldWriter, out StreamWriter newWriter)
         {
-            public List<LogEntry> LogEntries = new();
-            public FileInfo FileInfo;
+            if (path.Contains("D:\\Documents\\", StringComparison.OrdinalIgnoreCase)) throw new Exception("Do not write to documents!");
 
-            public override string ToString()
+            if (oldWriter != null)
             {
-                return FileInfo.FullName;
+                oldWriter.Flush();
+                oldWriter.Close();
+                oldWriter.Dispose();
             }
+
+            newWriter = new StreamWriter(path);
         }
 
-        private class LogEntry
+        private static List<LogFile> GetLogFiles(string logLocation)
         {
-            public DateTime Date { get; set; }
-            public string Text { get; set; }
+            List<LogFile> logFiles = new List<LogFile>();
 
-            public override string ToString()
+            foreach (string dir in Directory.GetDirectories(logLocation))
+                logFiles.AddRange(GetLogFiles(dir));
+
+            foreach (string path in Directory.GetFiles(logLocation))
             {
-                return Text;
+                string name = GetFileName(path);
+
+                if (IsBlacklisted(name)) continue;
+
+                string[] split = name.Split('.');
+                string server = split[1];
+                string channel = split[2];
+
+                logFiles.Add(new(path, server, channel, new StreamReader(path)));
             }
+
+            return logFiles;
+        }
+
+        private static bool IsBlacklisted(string name)
+        {
+            return name.Contains("core.weechat") || name.Contains("%2A");
+        }
+
+        private static string GetFileName(string path)
+        {
+            string[] split = path.Split('\\');
+            return split[^1];
         }
     }
 }
